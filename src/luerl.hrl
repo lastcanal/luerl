@@ -32,11 +32,12 @@
 %% around but does mean that there will be more explicit fiddleling to
 %% get it right. See block/2 and functioncall/4 for examples of this.
 
--record(luerl, {tabs,free,next,			%Table structure
+-record(luerl, {ttab,tfree,tnext,		%Table table, free, next
 		%%
 		g,				%Global table
 		env=[],				%Current environment
-		ft,ff,fn,			%Frame table, free, next
+		ftab,ffree,fnext,		%Frame table, free, next
+		stk=[],				%Current stack
 		%%
 		meta=[],			%Data type metatables
 		locf=false,			%Started local function
@@ -62,6 +63,7 @@
 %% There are two function types, this the Lua one, and an Erlang one
 %% with the same name. So no type for it.
 -record(function,{l=0,				%Line number (why?)
+		  local,			%Local block
 		  sz,				%Block size
 		  env,				%Environment
 		  pars,				%Parameters
