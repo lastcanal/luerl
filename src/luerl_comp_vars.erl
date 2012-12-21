@@ -56,26 +56,30 @@ debug_print(Opts, Format, Args) ->
 %%  Main problem here is to calculate local/free/used variables in the
 %%  right order. Must do everything going forwards.
 
-stats([S0|Ss0], Loc0, Free0, Used0, St0) ->
-    {S1,Snew,Sfree,St1} = stat(S0, Loc0, St0),
-    Sused = intersection(Sfree, Loc0),		%Add Sused
-    Loc1 = union(Snew, Loc0),
+stats([S0|Ss0], Local0, Free0, Used0, St0) ->
+    %% {S1,Snew,Sfree,St1} = stat(S0, Local0, St0),
+    %% Sused = intersection(Sfree, Local0),	%Add Sused
+    case stat(S0, Local0, St0) of		%Export S1,Snew,Sfree,Sused,St1
+	{S1,Snew,Sfree,St1} ->
+	    Sused = intersection(Sfree, Local0);	%Add Sused
+	{S1,Snew,Sfree,Sused,St1} -> ok
+    end,
+    Local1 = union(Snew, Local0),
     Used1 = union(Sused, Used0),
     Free1 = union(subtract(Sfree, Sused), Free0),
-    %% io:format("ss1: ~p\n", [{Loc0,Free0,Used0}]),
+    %% io:format("ss1: ~p\n", [{Local0,Free0,Used0}]),
     %% io:format("ss1: ~p\n", [{Snew,Sfree,Sused}]),
-    %% io:format("ss1: ~p\n", [{Loc1,Free1,Used1}]),
-    {Ss1,Loc2,Free2,Used2,St2} = stats(Ss0, Loc1, Free1, Used1, St1),
-    {[S1|Ss1],Loc2,Free2,Used2,St2};
-stats([], Loc, Free, Used, St) -> {[],Loc,Free,Used,St}.
+    %% io:format("ss1: ~p\n", [{Local1,Free1,Used1}]),
+    {Ss1,Local2,Free2,Used2,St2} = stats(Ss0, Local1, Free1, Used1, St1),
+    {[S1|Ss1],Local2,Free2,Used2,St2};
+stats([], Local, Free, Used, St) -> {[],Local,Free,Used,St}.
 
 %% stat(Stat, LocalVars, State) -> {Stat,NewVars,FreeVars,State}.
 
 stat(#assign{}=A, Loc, St) ->
     assign_stat(A, Loc, St);
-stat(#return{es=Es0}=R, Loc, St0) ->
-    {Es1,Esfree,St1} = explist(Es0, Loc, St0),
-    {R#return{es=Es1},[],Esfree,St1};
+stat(#return{}=R, Loc, St) ->
+    return_stat(R, Loc, St);
 stat(#break{}=B, _, St) -> {B,[],[],St};
 stat(#block{}=B, _, St) ->			%Sub-block
     block_stat(B, St);
@@ -89,8 +93,10 @@ stat(#nfor{}=For, Loc, St) ->
     numfor_stat(For, Loc, St);
 stat(#gfor{}=For, Loc, St) ->
     genfor_stat(For, Loc, St);
-stat(#local{}=L, Loc, St) ->
-    local_stat(L, Loc, St);
+stat(#local_assign{}=L, Loc, St) ->
+    local_assign_stat(L, Loc, St);
+stat(#local_fdef{}=L, Loc, St) ->
+    local_fdef_stat(L, Loc, St);
 stat(Exp0, Loc, St0) ->
     {Exp1,Efree,St1} = exp(Exp0, Loc, St0),
     {Exp1,[],Efree,St1}.
@@ -127,19 +133,28 @@ var_last(#key{k=Exp0}=K, Loc, St0) ->
     {Exp1,Efree,St1} = exp(Exp0, Loc, St0),
     {K#key{k=Exp1},Efree,St1}.
 
+%% return_stat(Return, LocalVars, State) -> {Return,NewVars,FreeVars,State}.
+
+return_stat(#return{es=Es0}=R, Loc, St0) ->
+    {Es1,Esfree,St1} = explist(Es0, Loc, St0),
+    {R#return{es=Es1},[],Esfree,St1}.
+
 %% block_stat(Block, State) -> {Block,NewVars,FreeVars,State}.
 
-block_stat(Block, St) -> do_block(Block, St).
+block_stat(B0, St0) ->
+    {B1,Bfree,St1} = do_block(B0, St0),
+    {B1,[],Bfree,St1}.
 
-%% do_block(Block, State) -> {Block,NewVars,FreeVars,State}.
-%% do_block(Block, LocalVars, State) -> {Block,NewVars,FreeVars,State}.
-%%  Do_block never returns external new variables. Fits into stat().
+%% do_block(Block, State) -> {Block,FreeVars,State}.
+%% do_block(Block, LocalVars, State) -> {Block,FreeVars,State}.
+%%  Do_block never returns external new variables as it never exports
+%%  variables.
 
 do_block(B, St) -> do_block(B, [], St).
 
-do_block(#block{b=Ss0}=B, Loc0, St0) ->
+do_block(#block{ss=Ss0}=B, Loc0, St0) ->
     {Ss1,Loc1,Bfree,Bused,St1} = stats(Ss0, Loc0, [], [], St0),
-    {B#block{b=Ss1,local=Loc1,free=Bfree,used=Bused},[],Bfree,St1}.
+    {B#block{ss=Ss1,local=Loc1,free=Bfree,used=Bused},Bfree,St1}.
 
 %% while_stat(While, LocalVars, State) -> {While,NewVars,FreeVars,State}.
 %%  While_stat never returns external new variables. Fits into stat().
@@ -148,7 +163,7 @@ do_block(#block{b=Ss0}=B, Loc0, St0) ->
 
 while_stat(#while{e=E0,b=B0}=W, Loc, St0) ->
     {E1,Efree,St1} = exp(E0, Loc, St0),
-    {B1,_,Bfree,St2} = do_block(B0, St1),
+    {B1,Bfree,St2} = do_block(B0, St1),
     Free = union(Efree, Bfree),
     {W#while{e=E1,b=B1},[],Free,St2}.
 
@@ -161,61 +176,67 @@ repeat_stat(#repeat{b=B0,e=E0}=R, _, St0) ->
     {B1,E1,Bfree,St1} = repeat_block(B0, E0, St0),
     {R#repeat{b=B1,e=E1},[],Bfree,St1}.
 
-repeat_block(#block{b=B0}=B, E0, St0) ->
+repeat_block(#block{ss=B0}=B, E0, St0) ->
     {B1,Bloc,Bfree,Bused,St1} = stats(B0, [], [], [], St0),
     %% Now do the test in the context of the block.
     {E1,Efree,St2} = exp(E0, Bloc, St1),
     Eused = intersection(Efree, Bloc),
     Free = union(subtract(Efree, Eused), Bfree),
     Used = union(Eused, Bused),
-    {B#block{b=B1,local=Bloc,free=Free,used=Used},E1,Free,St2}.
+    {B#block{ss=B1,local=Bloc,free=Free,used=Used},E1,Free,St2}.
 
 %% if_stat(If, LocalVars, State) -> {If,NewVars,FreeVars,State}.
 %%  The block info includes anything from the test expressions even
 %%  though we keep them separate.
 
 if_stat(#'if'{tests=Ts0,else=E0}=If, Loc, St0) ->
-    {Ts1,Tnew,Tfree,St1} = if_tests(Ts0, Loc, St0),
-    {E1,Enew,Efree,St2} = do_block(E0, St1),
-    New = union(Enew, Tnew),
+    {Ts1,Tfree,St1} = if_tests(Ts0, Loc, St0),
+    {E1,Efree,St2} = do_block(E0, St1),
     Free = union(Efree, Tfree),
-    {If#'if'{tests=Ts1,else=E1},New,Free,St2}.
+    {If#'if'{tests=Ts1,else=E1},[],Free,St2}.
 
 if_tests([{E0,B0}|Ts0], Loc, St0) ->
     {E1,Efree,St1} = exp(E0, Loc, St0),
-    {B1,Bnew,Bfree,St2} = do_block(B0, St1),
-    {Ts1,Tsnew,Tsfree,St3} = if_tests(Ts0, Loc, St2),
-    New = union(Bnew, Tsnew),
+    {B1,Bfree,St2} = do_block(B0, St1),
+    {Ts1,Tsfree,St3} = if_tests(Ts0, Loc, St2),
     Free = union([Efree,Bfree,Tsfree]),
-    {[{E1,B1}|Ts1],New,Free,St3};
-if_tests([], _, St) -> {[],[],[],St}.
+    {[{E1,B1}|Ts1],Free,St3};
+if_tests([], _, St) -> {[],[],St}.
 
 %% numfor_stat(For, LocalVars, State) -> {For,NewVars,FreeVars,State}.
 
 numfor_stat(#nfor{v=#var{n=N},init=I0,limit=L0,step=S0,b=B0}=For, Loc, St0) ->
     {[I1,L1,S1],Esfree,St1} = explist([I0,L0,S0], Loc, St0),
-    {B1,Bnew,Bfree,St2} = do_block(B0, [N], St1),
-    New = Bnew,
+    {B1,Bfree,St2} = do_block(B0, [N], St1),
     Free = union(Esfree, Bfree),
-    {For#nfor{init=I1,limit=L1,step=S1,b=B1},New,Free,St2}.
+    {For#nfor{init=I1,limit=L1,step=S1,b=B1},[],Free,St2}.
 
 %% genfor_stat(For, LocalVars, State) -> {For,NewVars,FreeVars,State}.
 
 genfor_stat(#gfor{vs=Vs,gens=Gs0,b=B0}=For, Loc, St0) ->
     {Gs1,Gfree,St1} = explist(Gs0, Loc, St0),
     Ns = lists:foldl(fun (#var{n=N}, Ns) -> add_element(N, Ns) end, [], Vs),
-    {B1,Bnew,Bfree,St2} = do_block(B0, Ns, St1),
-    New = Bnew,
+    {B1,Bfree,St2} = do_block(B0, Ns, St1),
     Free = union(Gfree, Bfree),
-    {For#gfor{gens=Gs1,b=B1},New,Free,St2}.
+    {For#gfor{gens=Gs1,b=B1},[],Free,St2}.
 
-%% local_stat(Local, LocalVars, State) -> {Local,NewVars,FreeVars,State}.
+%% local_assign_stat(Local, LocalVars, State) -> {Local,NewVars,FreeVars,State}.
 
-local_stat(#local{vs=Vs,es=Es0}=L, Loc, St0) ->
+local_assign_stat(#local_assign{vs=Vs,es=Es0}=L, Loc, St0) ->
     {Es1,Esfree,St1} = explist(Es0, Loc, St0),
     Ns = lists:foldl(fun (#var{n=N}, Ns) -> add_element(N, Ns) end, [], Vs),
     New = subtract(Ns, Loc),
-    {L#local{es=Es1},New,Esfree,St1}.
+    {L#local_assign{es=Es1},New,Esfree,St1}.
+
+%% local_fdef_stat(Local, LocalVars, State) -> {Local,NewVars,FreeVars,State}.
+
+local_fdef_stat(#local_fdef{v=#var{n=N},f=F0}=L, Loc, St0) ->
+    {F1,Ffree,St1} = functiondef(F0, null, St0),
+    New = [N],
+    Free = Ffree,
+    Used = intersection(Free, union(Loc, New)),
+    %% io:fwrite("lfs: ~p\n", [{Ffree,New,Free,Used}]),
+    {L#local_fdef{f=F1},New,Free,Used,St1}.
 
 %% explist(Exprs, LocalVars, State) -> {Exprs,FreeVars,State}.
 %% exp(Expr, LocalVars, State) -> {Expr,FreeVars,State}.
@@ -272,12 +293,12 @@ prefixexp_element(#mcall{m=#lit{v=N},as=As0}=M, Loc, St0) ->
 
 %% functiondef(Func, LocalVars, State) -> {Func,FreeVars,State}.
 
-functiondef(#fdef{ps=Ps,b=B0}=F, _, St0) ->
+functiondef(#fdef{ps=Ps,ss=Ss0}=F, _, St0) ->
     Loc0 = lists:foldl(fun (#var{n=N}, Vs) -> add_element(N, Vs);
 			   (_, Vs) -> Vs
 		       end, [], Ps),
-    {B1,Loc1,Bfree,Bused,St1} = stats(B0, Loc0, [], [], St0),
-    {F#fdef{b=B1,local=Loc1,free=Bfree,used=Bused},Bfree,St1}.
+    {Ss1,Loc1,Bfree,Bused,St1} = stats(Ss0, Loc0, [], [], St0),
+    {F#fdef{ss=Ss1,local=Loc1,free=Bfree,used=Bused},Bfree,St1}.
 
 %% tableconstructor(Fields, LocalVars, State) -> {Fields,FreeVars,State}.
 

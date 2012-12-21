@@ -91,6 +91,9 @@ instrs([?IF(Tis0, Fis0)|Is], St) ->
     Tis1 = instrs(Tis0, St),
     Fis1 = instrs(Fis0, St),
     [?IF(Tis1, Fis1)|instrs(Is, St)];
+instrs([?NFOR(V, Fis0)|Is], St) ->
+    Fis1 = instrs(Fis0, St),
+    [?NFOR(V, Fis1)|instrs(Is, St)];
 %% Nothing to do.
 instrs([I|Is], St) ->
     [I|instrs(Is, St)];

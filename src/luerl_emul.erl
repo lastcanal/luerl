@@ -118,6 +118,7 @@ get_global_key(Key, #luerl{g=G}=St) ->
 
 %% push_frame(Frame, State) -> State.
 %% pop_frame(State) -> State.
+%% pop_free_frame(State) -> State.
 %%  Pop_frame just pops top frame from environment.
 
 push_frame(F, #luerl{env=Fps,ftab=Ft0,ffree=[N|Ns]}=St) ->
@@ -129,6 +130,10 @@ push_frame(F, #luerl{env=Fps,ftab=Ft0,ffree=[],fnext=N}=St) ->
 
 pop_frame(#luerl{env=[_|Fps]}=St) ->		%Pop the frame
     St#luerl{env=Fps}.
+
+pop_free_frame(#luerl{env=[#fref{i=N}|Fps],ftab=Ft0,ffree=Ff}=St) ->
+    Ft1 = array:reset(N, Ft0),
+    St#luerl{env=Fps,ftab=Ft1,ffree=[N|Ff]}.
 
 %% alloc_table(State) -> {Tref,State}.
 %% alloc_table(InitialTable, State) -> {Tref,State}.
@@ -298,23 +303,28 @@ get_global_var(Key, #luerl{ttab=Ts,g=#tref{i=G}}) ->
 %% get_frame_var(Depth, Index, State) -> Val.
 
 set_frame_var(D, I, Val, #luerl{env=Fps,ftab=Ft0}=St) ->
-    Ft1 = set_stack_var(D, I, Val, Fps, Ft0),
+    Ft1 = set_frame_var(D, I, Val, Fps, Ft0),
     St#luerl{ftab=Ft1}.
 
 get_frame_var(D, I, #luerl{env=Fps,ftab=Ft}) ->
-    get_stack_var(D, I, Fps, Ft).
+    get_frame_var(D, I, Fps, Ft).
 
-set_stack_var(1, I, V, [#fref{i=N}|_], Ft) ->
+set_frame_var(1, I, V, [#fref{i=N}|_], Ft) ->
     F = setelement(I, array:get(N, Ft), V),
     array:set(N, F, Ft);
-set_stack_var(D, I, V, Fps, Ft) ->
+set_frame_var(2, I, V, [_,#fref{i=N}|_], Ft) ->
+    F = setelement(I, array:get(N, Ft), V),
+    array:set(N, F, Ft);
+set_frame_var(D, I, V, Fps, Ft) ->
     #fref{i=N} = lists:nth(D, Fps),
     F = setelement(I, array:get(N, Ft), V),
     array:set(N, F, Ft).
 
-get_stack_var(1, I, [#fref{i=N}|_], Ft) ->
+get_frame_var(1, I, [#fref{i=N}|_], Ft) ->
     element(I, array:get(N, Ft));
-get_stack_var(D, I, Fps, Ft) ->
+get_frame_var(2, I, [_,#fref{i=N}|_], Ft) ->
+    element(I, array:get(N, Ft));
+get_frame_var(D, I, Fps, Ft) ->
     #fref{i=N} = lists:nth(D, Fps),
     element(I, array:get(N, Ft)).
 
@@ -353,7 +363,7 @@ call({function,_}=Func, Args, St0) ->		%Internal erlang function
 exp(_, _) ->
     error(boom).
 
--record(frame, {is,acc,var,stk,fs,env,st}).
+-record(frame, {acc,var,env}).			%Save these for the GC
 
 %% emul(Instrs, Accumulator, LocalVariables, State).
 %% emul(Instrs, Accumulator, LocalVariables, Stack, Env, State).
@@ -362,10 +372,10 @@ emul(Is, #luerl{env=Env}=St) ->
     emul(Is, nil, {}, [], Env, St).
 
 emul([], Acc, Var, Stk, Env, St) ->
-    io:fwrite("el: ~p\n", [{Acc,Var}]),
+    io:fwrite("el: ~p\n", [{Acc,Var,Env}]),
     emul_1([], Acc, Var, Stk, Env, St);
 emul(Is, Acc, Var, Stk, Env, St) ->
-    io:fwrite("ei: ~p\n", [{hd(Is),Acc,Var}]),
+    io:fwrite("ei: ~p\n", [{hd(Is),Acc,Var,Env}]),
     stack_print(Stk),
     emul_1(Is, Acc, Var, Stk, Env, St).
 
@@ -449,11 +459,15 @@ emul_1([?IF_FALSE(T)|Is], Acc, Var, Stk, Env, St0) ->
     end;
 emul_1([?IF(True, False)|Is], Acc, Var, Stk, Env, St) ->
     do_if(Is, Acc, Var, Stk, Env, St, True, False);
-emul_1([?RETURN(0)|Is], Acc, Var, Stk0, Env, St) ->
-    throw({return,St#luerl.tag,[],Var,St});
-emul_1([?RETURN(Ac)|Is], Acc, Var, Stk0, Env, St) ->
-    {Ret,_} = pop_vals(Ac-1, Stk0, Acc),
-    throw({return,St#luerl.tag,Ret,Var,St});
+emul_1([?NFOR(V, Fis)|Is], Acc, Var, Stk, Env, St) ->
+    do_numfor(Is, Acc, Var, Stk, Env, St, V, Fis);
+emul_1([?BREAK|_], _, _, _, _, St) ->
+    throw({break,St#luerl.tag,St});
+emul_1([?RETURN(0)|_], _, _, _, _, St) ->
+    throw({return,St#luerl.tag,[],St});
+emul_1([?RETURN(Ac)|_], Acc, _, Stk, _, St) ->
+    {Ret,_} = pop_vals(Ac-1, Stk, Acc),
+    throw({return,St#luerl.tag,Ret,St});
 %% Stack instructions, mainly to/from accumulator.
 emul_1([?PUSH|Is], Acc, Var, Stk, Env, St) ->
     emul(Is, Acc, Var, [Acc|Stk], Env, St);
@@ -517,28 +531,45 @@ pop_args(0, Stk, _) -> {[],Stk};
 pop_args(Ac, Stk, Tail) -> pop_vals(Ac, Stk, Tail).
 
 %% do_block(Instrs, Acc, Vars, Stack, Env, State,
-%%          BlockInstrs, LocalVars, LocalSize) -> ReturnFromEmul.
+%%          BlockInstrs, Vars, LocalSize) -> ReturnFromEmul.
 
 do_block(Is, Acc0, Var0, Stk0, Env, St0, Bis, true, Sz) ->
     Var1 = erlang:make_tuple(Sz, nil),
-    {Acc1,_,_,_,St1} = 
+    {Acc1,_,_,_,St1} =
 	emul(Bis, Acc0, Var1, Stk0, Env, St0),
     emul(Is, Acc1, Var0, Stk0, Env, St1);
 do_block(Is, Acc, Var0, Stk0, Env, St0, Bis, false, Sz) ->
     Var1 = erlang:make_tuple(Sz, nil),
     St1 = push_frame(Var1, St0),
     io:format("bl: ~p\n", [St1#luerl.env]),
-    {Acc1,_,_,_,St2} = 
-	emul(Bis, Acc, Var1, Stk0, Env, St1),
+    {Acc1,_,_,_,St2} = emul(Bis, Acc, Var1, Stk0, Env, St1),
     io:format("bl> ~p\n", [St2#luerl.env]),
     St3 = pop_frame(St2),
     io:format("bl> ~p\n", [St3#luerl.env]),
+    emul(Is, Acc1, Var0, Stk0, Env, St3);
+%% The new not yet implemented local types.
+do_block(Is, Acc0, Var0, Stk0, Env, St0, Bis, local, Sz) ->
+    Var1 = erlang:make_tuple(Sz, nil),
+    {Acc1,_,_,_,St1} =
+	emul(Bis, Acc0, Var1, Stk0, Env, St0),
+    emul(Is, Acc1, Var0, Stk0, Env, St1);
+do_block(Is, Acc, Var0, Stk0, Env, St0, Bis, temporary, Sz) ->
+    Var1 = erlang:make_tuple(Sz, nil),
+    St1 = push_frame(Var1, St0),
+    {Acc1,_,_,_,St2} = emul(Bis, Acc, Var1, Stk0, Env, St1),
+    St3 = pop_free_frame(St2),			%We can free this frame
+    emul(Is, Acc1, Var0, Stk0, Env, St3);
+do_block(Is, Acc, Var0, Stk0, Env, St0, Bis, used, Sz) ->
+    Var1 = erlang:make_tuple(Sz, nil),
+    St1 = push_frame(Var1, St0),
+    {Acc1,_,_,_,St2} = emul(Bis, Acc, Var1, Stk0, Env, St1),
+    St3 = pop_frame(St2),
     emul(Is, Acc1, Var0, Stk0, Env, St3).
 
 do_op(Is, Acc, Var, Stk0, Env, St0, Op, Ac) ->
     {Args,Stk1} = pop_vals(Ac-1, Stk0, Acc),
     io:fwrite("op: ~p\n", [{Op,Args}]),
-    %% Fr = #frame{acc=Acc,var=Var,stk=Stk1,env=Env,st=St},
+    %% Fr = #frame{acc=Acc,var=Var,stk=Stk1,env=Env},
     {Res,St1}= do_op(Op, Args, St0),
     emul(Is, Res, Var, Stk1, Env, St1).
 
@@ -549,49 +580,85 @@ do_op(Op, [A1,A2], St) -> op(Op, A1, A2, St).
 
 do_fdef(Ps, Is, Local, Sz, Env, _) ->
     #function{local=Local,sz=Sz,pars=Ps,b=Is,env=Env}.
-    
+
 do_fcall(Is, Acc, Var, Stk0, Env, St, 0) ->
     [Func|Stk1] = Stk0,				%Get function
-    functioncall(Func, [], Is, Acc, Var, Stk1, Env, St);
+    functioncall(Is, Acc, Var, Stk1, Env, St, Func, []);
 do_fcall(Is, Acc, Var, Stk0, Env, St, Ac) ->
     {Args,Stk1} = pop_vals(Ac-1, Stk0, Acc),	%Pop arguments, last is in acc
     [Func|Stk2] = Stk1,				%Get function
-    functioncall(Func, Args, Is, Acc, Var, Stk2, Env, St).
+    functioncall(Is, Acc, Var, Stk2, Env, St, Func, Args).
 
-functioncall(Func, Args, St) ->
-    Fr = #frame{is=[],acc=nil,var={},stk=[],env=[],st=St},
-    functioncall(Func, Args, [Fr], St).
+%% functioncall(Function, Args, State) -> {Return,State}.
+%%  This is called from "within" things, for example metamethods, and
+%%  expects everything necessary to be in the state.
 
-functioncall(Func, Args, Is, Acc, Var, Stk, Env, St0) ->
-    Fr = #frame{is=Is,acc=Acc,var=Var,stk=Stk,env=Env,st=St0},
-    St1 = St0#luerl{stk=Stk},
-    %% St1 = St0#luerl{stk=Stk,env=Env}, Later!!!
-    functioncall(Func, Args, [Fr|Stk], St1).
+functioncall(Func, Args, #luerl{stk=Stk}=St0) ->
+    {Ret,St1} = functioncall(Func, Args, Stk, St0),
+    {Ret,St1}.
 
-functioncall(#function{sz=Sz,pars=Ps,b=Fis,env=Env}, Args, Stk0, St0) ->
-    Tag = St0#luerl.tag,			%Unique tag
-    Var0 = erlang:make_tuple(Sz, nil),
+%% functioncall(Instrs, Acc, Var, Stk, Env, State, Func, Args) -> <emul>
+%%  This is called from within code and continues with Instrs after
+%%  call. It must move everything into State.
+
+functioncall(Is, Acc, Var, Stk0, Env, St0, Func, Args) ->
+    Fr = #frame{var=Var,env=Env},		%Save current state
+    Stk1 = [Fr|Stk0],
+    {Ret,St1} = functioncall(Func, Args, Stk1, St0),
+    emul(Is, Ret, Var, Stk0, Env, St1).
+
+functioncall(#function{local=true,sz=Sz,env=Env,pars=Ps,b=Fis}, Args, Stk,
+	     #luerl{env=OldEnv}=St0) ->
+    Var0 = erlang:make_tuple(Sz, nil),		%Make local frame
     Var1 = assign_pars(Ps, Args, Var0),
-    {Acc,St2} = 
-	try
-	    {_,_,_,_,Stt} =
-		emul(Fis, nil, Var1, Stk0, St0#luerl.env, St0),
-	    io:fwrite("fr: ~p\n", [{Tag,[],Var1}]),
-	    {[],Stt}				%No return, no arguments
-	catch
-	    throw:{return,Tag,Ret,Var,St1} ->
-		io:fwrite("fr: ~p\n", [{Tag,Ret,Var}]),
-		{Ret,St1};
-	    throw:{break,Tag,_} ->
-		lua_error({illegal_op,break})
-	end,
-    #frame{is=Is,var=Ovar,stk=Ostk,env=Oenv} = hd(Stk0),
-    emul(Is, Acc, Ovar, Ostk, Oenv, St2);
-functioncall({function,Func}, Args, Stk, St0) ->
-    {Acc,St1} = Func(Args, St0),
-    #frame{is=Is,var=Ovar,stk=Ostk,env=Oenv} = hd(Stk),
-    emul(Is, Acc, Ovar, Ostk, Oenv, St1).
-    
+    {Ret,St1} = functioncall(Fis, Var1, Stk, Env, St0#luerl{env=Env}),
+    {Ret,St1#luerl{env=OldEnv}};
+functioncall(#function{local=false,sz=Sz,env=Env,pars=Ps,b=Fis}, Args, Stk,
+	     #luerl{env=OldEnv}=St0) ->
+    Var0 = erlang:make_tuple(Sz, nil),		%Make local frame
+    Var1 = assign_pars(Ps, Args, Var0),
+    St1 = push_frame(Var1, St0#luerl{env=Env}),
+    {Ret,St2} = functioncall(Fis, {}, Stk, St1#luerl.env, St1),
+    St3 = pop_frame(St2),
+    {Ret,St3#luerl{env=OldEnv}};
+%% The new not yet implemented local types.
+functioncall(#function{local=local,sz=Sz,env=Env,pars=Ps,b=Fis}, Args, Stk, St0) ->
+    Var0 = erlang:make_tuple(Sz, nil),		%Make local frame
+    Var1 = assign_pars(Ps, Args, Var0),
+    {Ret,St1} = functioncall(Fis, Var1, Stk, Env, St0#luerl{env=Env}),
+    {Ret,St1};
+functioncall(#function{local=temporary,sz=Sz,env=Env,pars=Ps,b=Fis}, Args, Stk, St0) ->
+    Var0 = erlang:make_tuple(Sz, nil),		%Make local frame
+    Var1 = assign_pars(Ps, Args, Var0),
+    St1 = push_frame(Var1, St0#luerl{env=Env}),
+    {Ret,St2} = functioncall(Fis, {}, Stk, St1#luerl.env, St1),
+    {Ret,pop_free_frame(St2)};
+functioncall(#function{local=used,sz=Sz,env=Env,pars=Ps,b=Fis}, Args, Stk, St0) ->
+    Var0 = erlang:make_tuple(Sz, nil),		%Make local frame
+    Var1 = assign_pars(Ps, Args, Var0),
+    St1 = push_frame(Var1, St0#luerl{env=Env}),
+    {Ret,St2} = functioncall(Fis, {}, Stk, St1#luerl.env, St1),
+    {Ret,pop_frame(St2)};
+functioncall({function,Func}, Args, Stk, #luerl{stk=Stk0}=St0) ->
+    %% Here we must save the stack in state as function may need it.
+    {Ret,St1} = Func(Args, St0#luerl{stk=Stk}),
+    {Ret,St1#luerl{stk=Stk0}}.			%Replace it
+
+functioncall(Fis, Var, Stk, Env, St0) ->
+    Tag = St0#luerl.tag,
+    %% Must use different St names else they become 'unsafe'.
+    try
+	{_,_,_,_,Sta} = emul(Fis, nil, Var, Stk, Env, St0),
+	io:fwrite("fr: ~p\n", [{Tag,[]}]),
+	{[],Sta}				%No return, no arguments
+    catch
+	throw:{return,Tag,Ret,Stb} ->
+	    io:fwrite("fr: ~p\n", [{Tag,Ret}]),
+	    {Ret,Stb};
+	throw:{break,Tag,_} ->
+	    lua_error({illegal_op,break})
+    end.
+
 assign_pars(Vs, As, Var) ->
     assign_pars_loop(Vs, As, Var).
 
@@ -603,6 +670,8 @@ assign_pars_loop([], _, Var) -> Var;		%No vararg, drop remain args
 assign_pars_loop(V, As, Var) ->			%This is a vararg!
     setelement(V, Var, As).
 
+%% do_repeat(Instrs, Acc, Var, Stack, Env, State, RepeatInstrs) -> <emul>
+
 do_repeat(Is, Acc0, Var0, Stk0, Env0, St0, Ris) ->
     {Acc1,Var1,Stk1,Env1,St1} =
 	emul(Ris, Acc0, Var0, Stk0, Env0, St0),
@@ -610,6 +679,8 @@ do_repeat(Is, Acc0, Var0, Stk0, Env0, St0, Ris) ->
 	true -> emul(Is, Acc1, Var1, Stk1, Env1, St1);
 	false -> do_repeat(Is, Acc1, Var1, Stk1, Env1, St1, Ris)
     end.
+
+%% do_while(Instrs, Acc, Var, Stack, Env, State, WhileEis, WhileBis) -> <emul>
 
 do_while(Is, Acc0, Var0, Stk0, Env0, St0, Eis, Wis) ->
     {Acc1,Var1,Stk1,Env1,St1} =
@@ -622,6 +693,15 @@ do_while(Is, Acc0, Var0, Stk0, Env0, St0, Eis, Wis) ->
 	false ->
 	    emul(Is, Acc1, Var1, Stk1, Env1, St1)
     end.
+
+loop_block(Is, Var, Stk, Env, St0, Do) ->
+    Tag = St0#luerl.tag,
+    St1 = try
+	      Do(St0)
+	  catch
+	      throw:{break,Tag,St} -> St
+	  end,
+    emul(Is, nil, Var, Stk, Env, St1).
 
 %% do_if(Is, Acc, Var, Stk, Env, St0, True, False) ->
 %%     St1 = case is_true_value(Acc) of
@@ -642,6 +722,32 @@ do_if_block(Bis, Acc0, Var, Stk, Env, St0, Is) ->
     {Acc1,_,_,_,St1} =
 	emul(Bis, Acc0, Var, Stk, Env, St0),
     emul(Is, Acc1, Var, Stk, Env, St1).
+
+%% do_numfor(Instrs, Acc, Var, Stack, Env, State, Varname, FromInstrs) -> <emul>
+
+do_numfor(Is, Step, Var, [Limit,Init|Stk], Env, St, _, Fis) ->
+    %% First check if we have numbers.
+    case luerl_lib:tonumbers([Init,Limit,Step]) of
+	[I,L,S] ->
+	    Do = fun (St) ->
+			 numfor_loop(I, L, S, Fis, Var, Stk, Env, St)
+		 end,
+	    loop_block(Is, Var, Stk, Env, St, Do);
+	nil -> badarg_error(loop, [Init,Limit,Step])
+    end.
+
+numfor_loop(N, Limit, Step, Fis, Var, Stk, Env, St0) ->
+    %% Leave the counter in the Acc for code to get.
+    if Step > 0.0, N =< Limit ->		%Keep going
+	    {_,_,_,_,St1} =
+		emul(Fis, N, Var, Stk, Env, St0),
+	    numfor_loop(N+Step, Limit, Step, Fis, Var, Stk, Env, St1);
+       Step < 0.0, N >= Limit ->		%Keep going
+	    {_,_,_,_,St1} =
+		emul(Fis, N, Var, Stk, Env, St0),
+	    numfor_loop(N+Step, Limit, Step, Fis, Var, Stk, Env, St1);
+       true -> St0				%Done!
+    end.
 
 %% getmetamethod(Object1, Object2, Event, State) -> Metod | nil.
 %% getmetamethod(Object, Event, State) -> Method | nil.
@@ -827,65 +933,65 @@ illegal_val_error(Val) ->
 %%  tables and frames are then freed and their indexes added to the
 %%  free lists.
 
-gc(#luerl{ttab=Ts0,meta=Meta,tfree=Free0,g=G,env=Env,ftab=Ft0,ffree=Ff0}=St) ->
+gc(#luerl{ttab=Tt0,tfree=Tf0,g=G,env=Env,ftab=Ft0,ffree=Ff0,meta=Meta}=St) ->
     %% The root set consisting of global table and environment.
     Root = [Meta#meta.number,Meta#meta.string,Meta#meta.userdata,G|Env],
     %% Mark all seen tables and frames, i.e. return them.
-    {SeenT,SeenF} = mark(Root, [], [], [], Ts0, Ft0),
+    {SeenT,SeenF} = mark(Root, [], [], [], Tt0, Ft0),
     io:format("gc: ~p\n", [{SeenT,SeenF}]),
     %% Free unseen tables and add freed to free list.
-    {Free1,Ts1} = filter_tables(SeenT, Free0, Ts0),
+    {Tf1,Tt1} = filter_tables(SeenT, Tf0, Tt0),
     {Ff1,Ft1} = filter_frames(SeenF, Ff0, Ft0),
-    St#luerl{ttab=Ts1,tfree=Free1,ftab=Ft1,ffree=Ff1}.
+    St#luerl{ttab=Tt1,tfree=Tf1,ftab=Ft1,ffree=Ff1}.
 
 %% mark(ToDo, MoreTodo, SeenTabs, SeenFrames, Tabs, Frames) ->
 %%     {SeenTabs,SeenFrames}.
 %% Scan over all live objects and mark seen tables by adding them to
 %% the seen list.
 
-mark([{in_table,_}=T|Todo], More, St, Sf, Ts, Ft) ->
+mark([{in_table,_}=T|Todo], More, St, Sf, Tt, Ft) ->
     %%io:format("gc: ~p\n", [T]),
-    mark(Todo, More, St, Sf, Ts, Ft);
-mark([#tref{i=T}|Todo], More, St0, Sf, Ts, Ft) ->
+    mark(Todo, More, St, Sf, Tt, Ft);
+mark([#tref{i=T}|Todo], More, St0, Sf, Tt, Ft) ->
     case ordsets:is_element(T, St0) of
 	true ->					%Already done
-	    mark(Todo, More, St0, Sf, Ts, Ft);
+	    mark(Todo, More, St0, Sf, Tt, Ft);
 	false ->				%Mark it and add to todo
 	    St1 = ordsets:add_element(T, St0),
-	    #table{a=Arr,t=Tab,m=Meta} = ?GET_TABLE(T, Ts),
+	    #table{a=Arr,t=Tab,m=Meta} = ?GET_TABLE(T, Tt),
 	    %% Have to be careful where add Tab and Meta as Tab is
 	    %% [{Key,Val}], Arr is array and Meta is
 	    %% nil|#tref{i=M}. We want lists.
 	    Aes = array:sparse_to_list(Arr),
 	    Tes = ttdict:to_list(Tab),
 	    mark([Meta|Todo], [[{in_table,T}],Tes,Aes,[{in_table,-T}]|More],
-		 St1, Sf, Ts, Ft)
+		 St1, Sf, Tt, Ft)
     end;
-mark([#fref{i=F}|Todo], More, St, Sf0, Ts, Ft) ->
+mark([#fref{i=F}|Todo], More, St, Sf0, Tt, Ft) ->
     case ordsets:is_element(F, Sf0) of
 	true ->					%Already done
-	    mark(Todo, More, St, Sf0, Ts, Ft);
+	    mark(Todo, More, St, Sf0, Tt, Ft);
 	false ->				%Mark it and add to todo
 	    Sf1 = ordsets:add_element(F, Sf0),
 	    Ses = tuple_to_list(array:get(F, Ft)),
-	    mark(Todo, [Ses|More], St, Sf1, Ts, Ft)
+	    mark(Todo, [Ses|More], St, Sf1, Tt, Ft)
     end;
-mark([#function{env=Env}|Todo], More, St, Sf, Ts, Ft) ->
-    mark(Todo, [Env|More], St, Sf, Ts, Ft);
+mark([#function{env=Env}|Todo], More, St, Sf, Tt, Ft) ->
+    mark(Todo, [Env|More], St, Sf, Tt, Ft);
 %% Catch these as they would match table key-value pair.
-mark([{function,_}|Todo], More, St, Sf, Ts, Ft) ->
-    mark(Todo, More, St, Sf, Ts, Ft);
-mark([#thread{}|Todo], More, St, Sf, Ts, Ft) ->
-    mark(Todo, More, St, Sf, Ts, Ft);
-mark([#userdata{m=Meta}|Todo], More, St, Sf, Ts, Ft) ->
-    mark([Meta|Todo], More, St, Sf, Ts, Ft);
-mark([{K,V}|Todo], More, St, Sf, Ts, Ft) ->	%Table key-value pair
+mark([{function,_}|Todo], More, St, Sf, Tt, Ft) ->
+    mark(Todo, More, St, Sf, Tt, Ft);
+mark([#thread{}|Todo], More, St, Sf, Tt, Ft) ->
+    mark(Todo, More, St, Sf, Tt, Ft);
+mark([#userdata{m=Meta}|Todo], More, St, Sf, Tt, Ft) ->
+    mark([Meta|Todo], More, St, Sf, Tt, Ft);
+mark([{K,V}|Todo], More, St, Sf, Tt, Ft) ->	%Table key-value pair
     %%io:format("mt: ~p\n", [{K,V}]),
-    mark([K,V|Todo], More, St, Sf, Ts, Ft);
-mark([_|Todo], More, St, Sf, Ts, Ft) ->		%Can ignore everything else
-    mark(Todo, More, St, Sf, Ts, Ft);
-mark([], [M|More], St, Sf, Ts, Ft) ->
-    mark(M, More, St, Sf, Ts, Ft);
+    mark([K,V|Todo], More, St, Sf, Tt, Ft);
+mark([_|Todo], More, St, Sf, Tt, Ft) ->		%Can ignore everything else
+    mark(Todo, More, St, Sf, Tt, Ft);
+mark([], [M|More], St, Sf, Tt, Ft) ->
+    mark(M, More, St, Sf, Tt, Ft);
 mark([], [], St, Sf, _, _) -> {St,Sf}.
 
 %% filter_tables(Seen, Free, Tables) -> {Free,Tables}.
@@ -893,28 +999,28 @@ mark([], [], St, Sf, _, _) -> {St,Sf}.
 %%  Filter tables/frames and return updated free lists and
 %%  tables/frames.
 
-filter_tables(Seen, Free0, Ts0) ->
-    Free1 = ?FOLD_TABLES(fun (K, _, Free) ->
-				 case ordsets:is_element(K, Seen) of
-				     true -> Free;
-				     false -> [K|Free]
-				 end
-			 end, Free0, Ts0),
-    Ts1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Ts0),
-    {Free1,Ts1}.
+filter_tables(Seen, Tf0, Tt0) ->
+    Tf1 = ?FOLD_TABLES(fun (K, _, Free) ->
+			       case ordsets:is_element(K, Seen) of
+				   true -> Free;
+				   false -> [K|Free]
+			       end
+		       end, Tf0, Tt0),
+    Tt1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Tt0),
+    {Tf1,Tt1}.
 
-filter_frames(Seen, Free0, Ft0) ->
+filter_frames(Seen, Ff0, Ft0) ->
     %% Unfortunately there is no array:sparse_mapfoldl.
-    Free1 = array:sparse_foldl(fun (F, _, Free) ->
+    Ff1 = array:sparse_foldl(fun (F, _, Free) ->
 				     case ordsets:is_element(F, Seen) of
 					 true -> Free;
 					 false -> [F|Free]
 				     end
-			     end, Free0, Ft0),
+			     end, Ff0, Ft0),
     Ft1 = array:sparse_map(fun (F, Fd) ->
 				   case ordsets:is_element(F, Seen) of
 				       true -> Fd;
 				       false -> undefined
 				   end
 			   end, Ft0),
-    {Free1,Ft1}.
+    {Ff1,Ft1}.

@@ -52,62 +52,8 @@ debug_print(Opts, Format, Args) ->
 	false -> ok
     end.
 
-%% push_frame(State) -> State.
-%% push_frame(Frame, State) -> State.
-%% pop_frame(State) -> State.
-
-push_frame(St) -> push_frame(new_frame(), St).
-
-push_frame(F, #chunk{fs=Fs}=St) ->
-    St#chunk{fs=[F|Fs]}.
-
-pop_frame(#chunk{fs=[_|Fs]}=St) ->
-    St#chunk{fs=Fs}.
-
-%% new_frame() -> Frame.
-%% add_frame_var(Name, Frame) -> Frame.
-%% find_frame_var(Name, Frame) -> {yes,Index} | no.
-%% fetch_frame_var(Name, Frame) -> Index.
-%%  We know frame will be tuples som we index from 1.
-
-new_frame() -> [].
-
-add_frame_var(N, Fs) -> add_frame_var(N, Fs, 1).
-
-add_frame_var(N, [{N,_}|_]=F, _) -> F;		%Already there, reuse it
-add_frame_var(N, [V|F], I) ->
-    [V|add_frame_var(N, F, I+1)];
-add_frame_var(N, [], I) -> [{N,I}].		%Add variable last
-
-find_frame_var(N, [{N,I}|_]) -> {yes,I};
-find_frame_var(N, [_|F]) -> find_frame_var(N, F);
-find_frame_var(_, []) -> no.
-
-fetch_frame_var(N, [{N,I}|_]) -> I;
-fetch_frame_var(N, [_|F]) -> find_frame_var(N, F).
-
-%% add_fs_var(Name, FrameStack) -> FrameStack.
-%% find_fs_var(Name, FrameStack) -> {yes,Depth,Index} | no.
-
-add_fs_var(N, [F|Fs]) -> [add_frame_var(N, F)|Fs].
-
-find_fs_var(N, Fs) -> find_fs_var(N, Fs, 1).
-
-find_fs_var(N, [F|Fs], D) ->
-    case find_frame_var(N, F) of
-	{yes,I} -> {yes,D,I};
-	no -> find_fs_var(N, Fs, D+1)
-    end;
-find_fs_var(_, [], _) -> no.
-
-add_local_var(N, #chunk{locv=true,locf=F0}=St) ->
-    F1 = add_frame_var(N, F0),
-    St#chunk{locf=F1};
-add_local_var(N, #chunk{locv=false,fs=Fs0}=St) ->
-    Fs1 = add_fs_var(N, Fs0),
-    St#chunk{fs=Fs1}.
-
-get_var(_, _) -> error(boom).
+%% set_var(Var) -> SetI.
+%% get_var(Var) -> GetI.
 
 set_var(#lvar{i=I}) -> ?STORE_LVAR(I);
 set_var(#fvar{d=D,i=I}) -> ?STORE_FVAR(D, I);
@@ -116,9 +62,6 @@ set_var(#gvar{n=N}) -> ?STORE_GVAR(N).
 get_var(#lvar{i=I}) -> ?LOAD_LVAR(I);
 get_var(#fvar{d=D,i=I}) -> ?LOAD_FVAR(D, I);
 get_var(#gvar{n=N}) -> ?LOAD_GVAR(N).
-
-get_frame(#chunk{locv=true,locf=F}) -> F;
-get_frame(#chunk{locv=false,fs=[F|_]}) -> F.
 
 %% stat(Stats, State) -> {Istats,State}.
 
@@ -131,12 +74,9 @@ stats([], St) -> {[],St}.
 
 %% stat(Stat, LocalVars, State) -> {Istat,State}.
 
-stat(#assign{vs=Vs,es=Es}, _, St) ->
-    assign_stat(Vs, Es, St);
-stat(#return{es=Es}=R, _, St0) ->
-    {Ies,St1} = explist(Es, false, St0),
-    {Ies ++ [?RETURN(length(Es))],St1};
-stat(#break{}=B, _, St) -> {B,[],[],St};
+stat(#assign{}=A, _, St) -> assign_stat(A, St);
+stat(#return{}=R, _, St) -> return_stat(R, St);
+stat(#break{}, _, St) -> {[?BREAK],St};
 stat(#block{}=B, _, St) ->			%Sub-block
     block_stat(B, St);
 stat(#while{}=W, _, St) ->
@@ -147,13 +87,17 @@ stat(#'if'{}=I, _, St) ->
     if_stat(I, St);
 stat(#nfor{}=F, _, St) ->
     numfor_stat(F, St);
-stat(#local{}=L, _, St) ->
-    local_stat(L, St);
+stat(#gfor{}=F, _, St) ->
+    genfor_stat(F, St);
+stat(#local_assign{}=L, _, St) ->
+    local_assign_stat(L, St);
+stat(#local_fdef{}=L, _, St) ->
+    local_fdef_stat(L, St);
 stat(Exp0, _, St0) ->
     {Exp1,St1} = exp(Exp0, false, St0),
     {Exp1,St1}.
 
-assign_stat(Vs, Es, St) ->
+assign_stat(#assign{vs=Vs,es=Es}, St) ->
     assign_loop(Vs, Es, St).
 
 %% assign_loop(Vars, Exps, State) -> {Iassigns,State}.
@@ -210,7 +154,13 @@ var_last(#key{k=Exp}, St0) ->
     {Ie,St1} = exp(Exp, true, St0),
     {[?PUSH] ++ Ie ++ [?SET_KEY],St1}.
 
-%% block_stat(Block, State) -> {Block,State}.
+%% return_stat(Return, State) -> {ReturnIs,State}.
+
+return_stat(#return{es=Es}, St0) ->
+    {Ies,St1} = explist(Es, false, St0),
+    {Ies ++ [?RETURN(length(Es))],St1}.
+
+%% block_stat(Block, State) -> {BlockIs,State}.
 
 block_stat(Block, St) -> do_block(Block, St).
 
@@ -219,7 +169,7 @@ block_stat(Block, St) -> do_block(Block, St).
 
 %% do_block(#block{b=Ss,local=[],used=[]}, St) ->	%No local variables in block
 %%     stats(Ss, St);				%Fold into surrounding block
-do_block(#block{b=Ss,local=Loc,used=U}, St0) ->
+do_block(#block{ss=Ss,local=Loc,used=U}, St0) ->
     Local = U == [],				%A local stack frame?
     {Ib,St1} = stats(Ss, St0),
     {[?BLOCK(Ib, Local, length(Loc))],St1}.
@@ -255,26 +205,35 @@ if_tests([], Else, St0) ->
 %% numfor_stat(For, State) -> {ForIs,State}.
 
 numfor_stat(#nfor{v=V,init=I,limit=L,step=S,b=B}, St0) ->
-    {Ii,St1} = exp(I, true, St0),
-    {Il,St2} = exp(L, true, St1),
-    {Is,St3} = exp(S, true, St2),
-    {Ib,St4} = do_block(B, St3),
-    {[?NFOR(V,Ii,Il,Is,Ib)],St4}.
-     
-%% local_stat(Local, State) -> {Ilocal,State}.
+    {Ies,St1} = explist([I,L,S], true, St0),
+    {Ib0,St2} = do_block(B, St1),
+    [?BLOCK(Is,Loc,Sz)] = Ib0,
+    Ib1 = [?BLOCK([set_var(V)|Is],Loc,Sz)],
+    {Ies ++ [?NFOR(V,Ib1)],St2}.
 
-local_stat(#local{vs=[#var{n=N}],es=[#fdef{}=F0]}=L, St0) ->
-    St1 = add_local_var(N, St0),
-    {F1,St2} = exp(F0, true, St1),
-    {L#local{vs=[get_var(N, St2)],es=[F1]},St2};
-local_stat(#local{vs=Vs,es=Es}, St) ->
+%% genfor_stat(For, State) -> {ForIs,State}.
+
+genfor_stat(#gfor{vs=Vs,gens=Gs,b=B}, St0) ->
+    {Igs,St1} = explist(Gs, false, St0),
+    {Ib0,St2} = do_block(B, St1),
+    [?BLOCK(Is,Loc,Sz)] = Ib0,
+    Ib1 = [?BLOCK(Is,Loc,Sz)],			%No-op sofar
+    {Igs ++ [?GFOR(Vs,Ib1)],St2}.
+
+%% local_assign_stat(Local, State) -> {Ilocal,State}.
+
+local_assign_stat(#local_assign{vs=Vs,es=Es}, St) ->
     assign_local(Vs, Es, St).
 
-assign_local(Vs, [], St0) ->
-    {Ias,St1} = assign_local_loop_var(Vs, 0, St0),
-    {[?LOAD_LIT(nil)] ++ Ias,St1};
+assign_local([V|Vs], [], St0) ->
+    {Ias,St1} = assign_local_loop_var(Vs, 1, St0),
+    {[?LOAD_LIT(nil)] ++ Ias ++ [set_var(V)],St1};
 assign_local(Vs, Es, St) ->
     assign_local_loop(Vs, Es, St).
+
+local_fdef_stat(#local_fdef{v=V,f=F}, St0) ->
+    {If,St1} = functiondef(F, St0),
+    {If ++ [set_var(V)],St1}.
 
 %% assign_local_loop(Vars, Exps, State) -> {Iassigns,State}.
 %%  Must be careful with pushing and popping values here. Make sure
@@ -296,6 +255,7 @@ assign_local_loop([V|Vs], [E|Es], St0) ->
 assign_local_loop([], Es, St) ->
     assign_local_loop_exp(Es, St).
 
+%% This expects a surrounding setting a variable, otherwise excess ?POP.
 assign_local_loop_var([V|Vs], Vc, St0) ->
     {Ias,St1} = assign_local_loop_var(Vs, Vc+1, St0),
     {Ias ++ [set_var(V),?POP],St1};
@@ -365,9 +325,9 @@ prefixexp_rest(#dot{e=Exp,r=Rest}, S, St0) ->
     {Ie ++ Ir,St2};
 prefixexp_rest(Exp, S, St) -> prefixexp_element(Exp, S, St).
 
-prefixexp_element(#key{k=#lit{v=K}}, S, St) ->
+prefixexp_element(#key{k=#lit{v=K}}, _, St) ->
     {[?GET_LIT_KEY(K)],St};			%Table is in Acc
-prefixexp_element(#key{k=E}, S, St0) ->
+prefixexp_element(#key{k=E}, _, St0) ->
     {Ie,St1} = exp(E, true, St0),
     {[?PUSH] ++ Ie ++ [?GET_KEY],St1};		%Table is in Acc
 prefixexp_element(#fcall{as=As}, S, St0) ->
@@ -385,7 +345,7 @@ prefixexp_element(#mcall{m=#lit{v=K},as=As}, S, St0) ->
 
 %% functiondef(Func, State) -> {Func,State}.
 
-functiondef(#fdef{ps=Ps0,b=Ss,local=Loc,used=U}=F, St0) ->
+functiondef(#fdef{ps=Ps0,ss=Ss,local=Loc,used=U}, St0) ->
     Local = U == [],				%A local stack frame?
     Ps1 = func_pars(Ps0),
     {Ib,St1} = stats(Ss, St0),

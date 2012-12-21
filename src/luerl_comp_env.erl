@@ -37,9 +37,6 @@
 
 -export([chunk/2]).
 
--import(ordsets, [add_element/2,is_element/2,union/1,union/2,
-		  subtract/2,intersection/2,new/0]).
-
 %% chunk(St0) -> {ok,St0};
 chunk(#chunk{code=C0}=St0, Opts) ->
     {C1,St1} = exp(C0, St0),
@@ -64,6 +61,9 @@ push_frame(F, #chunk{fs=Fs}=St) ->
 pop_frame(#chunk{fs=[_|Fs]}=St) ->
     St#chunk{fs=Fs}.
 
+get_frame(#chunk{locv=true,locf=F}) -> F;
+get_frame(#chunk{locv=false,fs=[F|_]}) -> F.
+
 %% new_frame() -> Frame.
 %% add_frame_var(Name, Frame) -> Frame.
 %% find_frame_var(Name, Frame) -> {yes,Index} | no.
@@ -82,9 +82,6 @@ add_frame_var(N, []) -> [{N,1}].
 find_frame_var(N, [{N,I}|_]) -> {yes,I};
 find_frame_var(N, [_|F]) -> find_frame_var(N, F);
 find_frame_var(_, []) -> no.
-
-fetch_frame_var(N, [{N,I}|_]) -> I;
-fetch_frame_var(N, [_|F]) -> find_frame_var(N, F).
 
 %% add_fs_var(Name, FrameStack) -> FrameStack.
 %% find_fs_var(Name, FrameStack) -> {yes,Depth,Index} | no.
@@ -122,9 +119,6 @@ get_var(N, #chunk{locv=false,fs=Fs}) ->
 	no -> #gvar{n=N}
     end.
 
-get_frame(#chunk{locv=true,locf=F}) -> F;
-get_frame(#chunk{locv=false,fs=[F|_]}) -> F.
-
 %% stat(Stats, State) -> {Stats,State}.
 
 stats([S0|Ss0], St0) ->
@@ -141,19 +135,23 @@ stat(#assign{}=A, _, St) ->
 stat(#return{es=Es0}=R, _, St0) ->
     {Es1,St1} = explist(Es0, St0),
     {R#return{es=Es1},St1};
-stat(#break{}=B, _, St) -> {B,[],[],St};
+stat(#break{}=B, _, St) -> {B,St};
 stat(#block{}=B, _, St) ->			%Sub-block
     block_stat(B, St);
 stat(#while{}=W, _, St) ->
     while_stat(W, St);
 stat(#repeat{}=R, _, St) ->
     repeat_stat(R, St);
-stat(#nfor{}=F, _, St) ->
-    numfor_stat(F, St);
 stat(#'if'{}=I, _, St) ->
     if_stat(I, St);
-stat(#local{}=L, _, St) ->
-    local_stat(L, St);
+stat(#nfor{}=F, _, St) ->
+    numfor_stat(F, St);
+stat(#gfor{}=F, _, St) ->
+    genfor_stat(F, St);
+stat(#local_assign{}=L, _, St) ->
+    local_assign_stat(L, St);
+stat(#local_fdef{}=L, _, St) ->
+    local_fdef_stat(L, St);
 stat(Exp0, _, St0) ->
     {Exp1,St1} = exp(Exp0, St0),
     {Exp1,St1}.
@@ -196,14 +194,14 @@ block_stat(Block, St) -> do_block(Block, St).
 %% do_block(Block, State) -> {Block,State}.
 %%  Do_block never returns external new variables. Fits into stat().
 
-do_block(#block{b=Ss0,used=U}=B, St0) ->
+do_block(#block{ss=Ss0,used=U}=B, St0) ->
     Do = fun(S0) ->
 		 {Ss1,S1} = stats(Ss0, S0),
 		 Frame = get_frame(S1),
 		 {{Frame,Ss1},S1}
 	 end,
     {{Fr,Ss1},St1} = with_block(Do, U == [], St0),
-    {B#block{b=Ss1,local=Fr},St1}.
+    {B#block{ss=Ss1,local=Fr},St1}.
 
 %% with_block(Do, LocalBlock, State) -> {Ret,State}.
 %%  Do a block initialising/clearing frames.
@@ -252,26 +250,52 @@ if_tests([], St) -> {[],St}.
 %% numfor_stat(For, State) -> {For,State}.
 
 numfor_stat(#nfor{v=V0,init=I0,limit=L0,step=S0,b=B0}=F, St0) ->
-    {V1,St1} = exp(V0, St0),
-    {[I1,L1,S1],St2} = explist([I0,L0,S0], St1),
-    {B1,St3} = do_block(B0, St2),
-    {F#nfor{v=V1,init=I1,limit=L1,step=S1,b=B1},St3}.
+    {[I1,L1,S1],St1} = explist([I0,L0,S0], St0),
+    {[V1],B1,St2} = for_block([V0], B0, St1),
+    {F#nfor{v=V1,init=I1,limit=L1,step=S1,b=B1},St2}.
 
-%% local_stat(Local, State) -> {Local,State}.
-%%  Special case function definition to catch recursive function.
+%% genfor_stat(For, State) -> {For,State}.
 
-local_stat(#local{vs=[#var{n=N}],es=[#fdef{}=F0]}=L, St0) ->
-    St1 = add_local_var(N, St0),
-    {F1,St2} = exp(F0, St1),
-    {L#local{vs=[get_var(N, St2)],es=[F1]},St2};
-local_stat(#local{vs=Vs0,es=Es0}=L, St0) ->
+genfor_stat(#gfor{vs=Vs0,gens=Gs0,b=B0}=F, St0) ->
+    {Gs1,St1} = explist(Gs0, St0),
+    {Vs1,B1,St2} = for_block(Vs0, B0, St1),
+    {F#gfor{vs=Vs1,gens=Gs1,b=B1},St2}.
+
+for_block(Vs0, #block{ss=Ss0,used=U}=B, St0) ->
+    Do = fun (S0) ->
+		 Fun = fun (#var{n=N}, Sa) ->
+			       Sb = add_local_var(N, Sa),
+			       {get_var(N, Sb),Sb}
+		       end,
+		 {Vs1,S1} = lists:mapfoldl(Fun, S0, Vs0),
+		 {Ss1,S2} = stats(Ss0, S1),
+		 Frame = get_frame(S2),
+		 {{Vs1,Frame,Ss1},S2}
+	 end,
+    {{Vs1,Fr,Ss1},St1} = with_block(Do, U == [], St0),
+    {Vs1,B#block{ss=Ss1,local=Fr},St1}.
+
+%% local_assign_stat(Local, State) -> {Local,State}.
+
+local_assign_stat(#local_assign{vs=Vs0,es=Es0}=L, St0) ->
     {Es1,St1} = explist(Es0, St0),
     Fun = fun (#var{n=N}, S0) ->
 		  S1 = add_local_var(N, S0),
 		  {get_var(N, S1),S1}
 	  end,
     {Vs1,St2} = lists:mapfoldl(Fun, St1, Vs0),
-    {L#local{vs=Vs1,es=Es1},St2}.
+    {L#local_assign{vs=Vs1,es=Es1},St2}.
+
+%% local_fdef_stat(Local, State) -> {Local,State}.
+
+local_fdef_stat(#local_fdef{v=#var{n=N},f=F0}=L, St0) ->
+    St1 = add_local_var(N, St0),
+    {F1,St2} = functiondef(F0, St1),
+    V1 = get_var(N, St2),
+    %% io:fwrite("lf: ~p\n", [{St0#chunk.locv,St0#chunk.locf,St0#chunk.fs}]),
+    %% io:fwrite("lf: ~p\n", [{St1#chunk.locv,St1#chunk.locf,St1#chunk.fs}]),
+    %% io:fwrite("lf: ~p\n", [{St2#chunk.locv,St2#chunk.locf,St2#chunk.fs}]),
+    {L#local_fdef{v=V1,f=F1},St2}.
 
 %% explist(Exprs, LocalVars, State) -> {Exprs,FreeVars,State}.
 %% exp(Expr, LocalVars, State) -> {Expr,FreeVars,State}.
@@ -325,7 +349,7 @@ prefixexp_element(#mcall{as=As0}=M, St0) ->
 
 %% functiondef(Func, State) -> {Func,State}.
 
-functiondef(#fdef{ps=Ps0,b=Ss0,used=U}=F, St0) ->
+functiondef(#fdef{ps=Ps0,ss=Ss0,used=U}=F, St0) ->
     Local = U == [],				%A local stack frame?
     Do = fun (S0) ->
 		 Fun = fun (#var{n=N}, Sa) ->
@@ -338,7 +362,7 @@ functiondef(#fdef{ps=Ps0,b=Ss0,used=U}=F, St0) ->
 		 {{Ps1,Frame,Ss1},S2}
 	 end,
     {{Ps1,Fr,Ss1},St1} = with_block(Do, Local, St0),
-    {F#fdef{ps=Ps1,b=Ss1,local=Fr},St1}.
+    {F#fdef{ps=Ps1,ss=Ss1,local=Fr},St1}.
 
 %% tableconstructor(Fields, State) -> {Fields,State}.
 

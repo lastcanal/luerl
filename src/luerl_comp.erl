@@ -95,8 +95,10 @@ list_passes() ->				%Scanning string
 
 forms_passes() ->				%Doing the forms
     [{do,fun do_pass_1/1},
-     {do,fun do_pass_2/1},
-     {do,fun do_pass_3/1},
+     {do,fun do_comp_vars/1},
+     {when_flag,to_vars,{done,fun(Cst) -> {ok,Cst} end}},
+     {do,fun do_comp_env/1},
+     {when_flag,to_env,{done,fun(Cst) -> {ok,Cst} end}},
      {do,fun do_code_gen/1},
      {unless_flag,no_iopt,{do,fun do_peep_op/1}}].
 
@@ -148,14 +150,14 @@ do_pass_1(#comp{code=C0,opts=Opts}=Cst) ->
     {ok,C1} = chunk(C0, Opts),
     {ok,Cst#comp{code=C1}}.
 
-do_pass_2(Cst) ->
+do_comp_vars(Cst) ->
     case luerl_comp_vars:chunk(Cst#comp.code, Cst#comp.opts) of
 	{ok,C1} -> {ok,Cst#comp{code=C1}};
 	{ok,C1,Ws} -> {ok,Cst#comp{code=C1,warnings=Ws}};
 	{error,Es} -> {error,Cst#comp{errors=Es}}
     end.
 
-do_pass_3(Cst) ->
+do_comp_env(Cst) ->
     case luerl_comp_env:chunk(Cst#comp.code, Cst#comp.opts) of
 	{ok,C1} -> {ok,Cst#comp{code=C1}};
 	{ok,C1,Ws} -> {ok,Cst#comp{code=C1,warnings=Ws}};
@@ -198,6 +200,9 @@ debug_print(Opts, Format, Args) ->
 %% The first pass (pass_1).
 %% Here we normalise the code and convert it to an internal form. 
 
+%% stats([{local,L,{functiondef,_,Name,_,_}=F}|Ss], St) ->
+%%     %% Need to split this to handle recursive definitions.
+%%     stats([{local,L,{assign,L,[Name],[{nil,L}]}},F|Ss], St);
 stats([{';',_}|Ss], St) -> stats(Ss, St);	%No-op so we drop it
 stats([S0|Ss0], St0) ->
     {S1,St1} = stat(S0, St0),
@@ -208,49 +213,40 @@ stats([], St) -> {[],St}.
 %% stat(Statement, State) -> {CStat,State}.
 %%  Do a statement. The ';' statement will caught and removed in stats/2.
 
-stat({assign,L,Vs,Es}, St0) ->
-    {Ces,St1} = explist(Es, St0),
-    {Cvs,St2} = assign_loop(Vs, St1),
-    {#assign{l=L,vs=Cvs,es=Ces},St2};
-stat({return,L,Es}, St0) ->
-    {Ces,St1} = explist(Es, St0),
-    {#return{l=L,es=Ces},St1};
+stat({assign,Line,Vs,Es}, St) ->
+    assign_stat(Line, Vs, Es, St);
+stat({return,Line,Es}, St) ->
+    return_stat(Line, Es, St);
 stat({break,L}, St) ->				%Interesting
     {#break{l=L},St};
-stat({block,L,B}, St0) ->
-    {Cb,St1} = block(L, B, St0),
-    {Cb,St1};
-stat({while,L,Exp,B}, St0) ->
-    {Ce,St1} = exp(Exp, St0),
-    {Cb,St2} = block(L, B, St1),
-    {#while{l=L,e=Ce,b=Cb},St2};
-stat({repeat,L,B,Exp}, St0) ->
-    {Cb,St1} = block(L, B, St0),
-    {Ce,St2} = exp(Exp, St1),
-    {#repeat{l=L,b=Cb,e=Ce},St2};
-stat({'if',Line,Tests,Else}, St0) ->
-    {Cts,St1} = if_tests(Line, Tests, St0),
-    {Ce,St2} = block(Line, Else, St1),
-    {#'if'{l=Line,tests=Cts,else=Ce},St2};
-stat({for,Line,V0,I0,L0,B0}, St0) ->		%Default step of 1.0
-    {V1,I1,L1,S1,B1,St1} = numeric_for(Line, V0, I0, L0, {'NUMBER',Line,1.0},
-				       B0, St0),
-    {#nfor{l=Line,v=V1,init=I1,limit=L1,step=S1,b=B1},St1};
-stat({for,Line,V0,I0,L0,S0,B0}, St0) ->
-    {V1,I1,L1,S1,B1,St1} = numeric_for(Line, V0, I0, L0, S0, B0, St0),
-    {#nfor{l=Line,v=V1,init=I1,limit=L1,step=S1,b=B1},St1};
-stat({for,Line,Ns0,Gs0,B0}, St0) ->
-    {Ns1,Gs1,B1,St1} = generic_for(Line, Ns0, Gs0, B0, St0),
-    {#gfor{l=Line,vs=Ns1,gens=Gs1,b=B1},St1};
-stat({functiondef,L,Fname,Ps,B}, St0) ->
-    {V,F,St1} = functiondef(L, Fname, Ps, B, St0),
-    {#assign{l=L,vs=[V],es=[F]},St1};
-stat({local,L,Local}, St0) ->
-    {Vs,Es,St1} = local(Local, St0),
-    {#local{l=L,vs=Vs,es=Es},St1};
+stat({block,Line,B}, St) ->
+    block_stat(Line, B, St);
+stat({while,Line,Exp,B}, St) ->
+    while_stat(Line, Exp, B, St);
+stat({repeat,Line,B,Exp}, St) ->
+    repeat_stat(Line, B, Exp, St);
+stat({'if',Line,Tests,Else}, St) ->
+    if_stat(Line, Tests, Else, St);
+stat({for,Line,V,I,L,B}, St) ->			%Default step of 1.0
+    numfor_stat(Line, V, I, L, {'NUMBER',Line,1.0}, B, St);
+stat({for,Line,V,I,L,S,B}, St) ->
+    numfor_stat(Line, V, I, L, S, B, St);
+stat({for,Line,Ns,Gs,B}, St) ->
+    genfor_stat(Line, Ns, Gs, B, St);
+stat({functiondef,Line,Fname,Ps,B}, St) ->
+    fdef_stat(Line, Fname, Ps, B, St);
+stat({local,Line,Local}, St) ->
+    local_stat(Line, Local, St);
 stat(Exp, St0) ->
     {Ce,St1} = exp(Exp, St0),
     {Ce,St1}.
+
+%% assign_stat(Line, Vars, Exps, State) -> {Assign,State}.
+
+assign_stat(Line, Vs, Es, St0) ->
+    {Ces,St1} = explist(Es, St0),
+    {Cvs,St2} = assign_loop(Vs, St1),
+    {#assign{l=Line,vs=Cvs,es=Ces},St2}.
 
 assign_loop([V|Vs], St0) ->
     {Cv,St1} = var(V, St0),
@@ -283,6 +279,43 @@ var_last({key_field,L,Exp}, St0) ->
     {Ce,St1} = exp(Exp, St0),
     {#key{l=L,k=Ce},St1}.
 
+%% return_stat(Line, Exps, State) -> {Return,State}.
+
+return_stat(Line, Es, St0) ->
+    {Ces,St1} = explist(Es, St0),
+    {#return{l=Line,es=Ces},St1}.
+
+%% block_stat(Line, Stats, State) -> {Block,State}.
+
+block_stat(Line, Stats, St0) ->
+    {Cb,St1} = block(Line, Stats, St0),
+    {Cb,St1}.
+
+block(L, Ss0, St0) ->
+    {Ss1,St1} = stats(Ss0, St0),
+    {#block{l=L,ss=Ss1},St1}.
+
+%% while_stat(Line, Exp, Block, State) -> {While,State}.
+
+while_stat(Line, Exp, B, St0) ->
+    {Ce,St1} = exp(Exp, St0),
+    {Cb,St2} = block(Line, B, St1),
+    {#while{l=Line,e=Ce,b=Cb},St2}.
+
+%% repeat_stat(Line, Block, Exp, State) -> {Repeat,State}.
+
+repeat_stat(Line, B, Exp, St0) ->
+    {Cb,St1} = block(Line, B, St0),
+    {Ce,St2} = exp(Exp, St1),
+    {#repeat{l=Line,b=Cb,e=Ce},St2}.
+
+%% if_stat(Line, Test, Else, State) -> {If,State}.
+
+if_stat(Line, Tests, Else, St0) ->
+    {Cts,St1} = if_tests(Line, Tests, St0),
+    {Ce,St2} = block(Line, Else, St1),
+    {#'if'{l=Line,tests=Cts,else=Ce},St2}.
+
 if_tests(L, Ts, St) ->
     Test = fun ({T,B}, S0) ->
 		   {Ct,S1} = exp(T, S0),
@@ -291,27 +324,27 @@ if_tests(L, Ts, St) ->
 	   end,
     lists:mapfoldl(Test, St, Ts).
 
-%% numeric_for(Line, Var, Init, Limit, Step, Stats, State) ->
-%%     (Var, Init, Limit, Step, Block, State).
+%% numfor_stat(Line, Var, Init, Limit, Step, Stats, State) -> {NumFor, State}.
 
-numeric_for(L, {'NAME',Ln,N}, I0, L0, S0, Ss, St0) ->
+numfor_stat(Line, {'NAME',Ln,N}, I0, L0, S0, Ss, St0) ->
     Var = var_name(Ln, N),
     {[I1,L1,S1],St1} = explist([I0,L0,S0], St0),
-    {B,St2} = block(L, Ss, St1),
-    {Var,I1,L1,S1,B,St2}.
+    {B,St2} = block(Line, Ss, St1),
+    {#nfor{l=Line,v=Var,init=I1,limit=L1,step=S1,b=B},St2}.
 
-%% generic_for(Line, Vars, Generators, Stats, State) ->
-%%     (Vars, Generators, Block, State).
+%% genfor_stat(Line, Vars, Generators, Stats, State) -> {GenFor,State}.
 
-generic_for(L, Vs0, Gs0, Ss, St0) ->
+genfor_stat(Line, Vs0, Gs0, Ss, St0) ->
     Vs1 = [ var_name(Ln, N) || {'NAME',Ln,N} <- Vs0 ],
     {Gs1,St1} = explist(Gs0, St0),
-    {B,St2} = block(L, Ss, St1),
-    {Vs1,Gs1,B,St2}.
+    {B,St2} = block(Line, Ss, St1),
+    {#gfor{l=Line,vs=Vs1,gens=Gs1,b=B},St2}.
 
-block(L, Ss0, St0) ->
-    {Ss1,St1} = stats(Ss0, St0),
-    {#block{l=L,b=Ss1},St1}.
+%% fdef_stat(Line, Name, Pars, Stats, State) -> {Fdef,State}.
+
+fdef_stat(Line, Fname, Ps, B, St0) ->
+    {V,F,St1} = functiondef(Line, Fname, Ps, B, St0),
+    {#assign{l=Line,vs=[V],es=[F]},St1}.
 
 %% functiondef(Line, Pars, Block, State) -> {CFunc,State}.
 %% functiondef(Line, Name, Pars, Block, State) -> {Var,CFunc,State}.
@@ -319,9 +352,9 @@ block(L, Ss0, St0) ->
 %%  really means is that the function has an extra parameter 'self'
 %%  prepended to the paramter list.
 
-functiondef(L, Ps, B, St0) ->
-    {Cp,Cb,St1} = function_block(Ps, B, St0),
-    {#fdef{l=L,ps=Cp,b=Cb},St1}.
+functiondef(L, Ps, Stats, St0) ->
+    {Cp,Cb,St1} = function_block(Ps, Stats, St0),
+    {#fdef{l=L,ps=Cp,ss=Cb},St1}.
 
 functiondef(L, Name0, Ps0, B, St0) ->
     %% Check if method and transform method to 'NAME'.
@@ -369,25 +402,25 @@ funcname_last({'NAME',L,N}, St) ->
     %% Transform this to key_field with the name string.
     {#key{l=L,k=lit_name(L, N)},St}.
 
-%% local(Local, State) -> {Vars,Values,State}.
+%% local_stat(Line, Local, State) -> {Assign,State}.
 %%  Create and assign local variables.
 
-local({assign,_,Ns,Es}, St0) ->
+local_stat(Line, {functiondef,Lf,Name,Ps,B}, St0) ->
+    {Var,F,St1} = functiondef(Lf, Name, Ps, B, St0),
+    {#local_fdef{l=Line,v=Var,f=F},St1};
+local_stat(Line, {assign,_,Ns,Es}, St0) ->
     {Ces,St1} = explist(Es, St0),
     {Cns,St2} = lists:mapfoldl(fun (V, St) -> var(V, St) end, St1, Ns),
-    {Cns,Ces,St2};
-local({functiondef,Lf,Name,Ps,B}, St0) ->
-    %% Name is really only a variable here.
-    {V,F,St1} = functiondef(Lf, Name, Ps, B, St0),
-    {[V],[F],St1}.
+    {#local_assign{l=Line,vs=Cns,es=Ces},St2}.
+
+%% explist(Exprs, State) -> {Ins,State}.
+%% exp(Expression, State) -> {Ins,State}.
 
 explist([E|Es], St0) ->
     {Ce,St1} = exp(E, St0),
     {Ces,St2} = explist(Es, St1),
     {[Ce|Ces],St2};
 explist([], St) -> {[],St}.			%No expressions at all
-
-%% exp(Expression, State) -> {Ins,State}.
 
 exp({nil,L}, St) -> {#lit{l=L,v=nil},St};
 exp({false,L}, St) -> {#lit{l=L,v=false},St};

@@ -44,7 +44,10 @@
 
 -record(break, {l}).
 
--record(block, {l,b=[],local=[],free=[],used=[]}).
+-record(block, {l,ss=[],
+		local=[],free=[],		%Local, free variables
+		used=[],			%Variables in sub blocks
+		locf=false}).			%Local function
 
 -record(while, {l,e,b=[]}).
 
@@ -56,10 +59,15 @@
 
 -record('if', {l,tests=[],else}).
 
--record(local, {l,vs,es}).
+-record(local_assign, {l,vs,es}).
+
+-record(local_fdef, {l,v,f}).
 
 %% Expressions.
--record(fdef, {l,ps=[],b=[],local=[],free=[],used=[]}).
+-record(fdef, {l,ps=[],ss=[],
+	       local=[],free=[],		%Local, free variables
+	       used=[],				%Variables in sub blocks
+	       locf=false}).			%Local function
 
 -record(lit, {l,v}).
 
@@ -114,7 +122,9 @@
 -define(IF_TRUE(T), {if_true,T}).
 -define(IF_FALSE(T), {if_false,T}).
 -define(IF(T, F), {'if',T,F}).
--define(NFOR(V,I,L,S,B), {nfor,V,I,L,S,B}).
+-define(NFOR(V, B), {nfor,V,B}).
+-define(GFOR(Vs, B), {gfor,Vs,B}).
+-define(BREAK, break).
 -define(RETURN(Ac), {return,Ac}).
 %% Stack instructions, mainly to/from accumulator.
 -define(PUSH, push).

@@ -33,16 +33,19 @@
 %% get it right. See block/2 and functioncall/4 for examples of this.
 
 -record(luerl, {ttab,tfree,tnext,		%Table table, free, next
-		%%
-		g,				%Global table
-		env=[],				%Current environment
 		ftab,ffree,fnext,		%Frame table, free, next
+		g,				%Global table
+		%%
+		env=[],				%Current environment
 		stk=[],				%Current stack
 		%%
 		meta=[],			%Data type metatables
 		locf=false,			%Started local function
 		tag				%Unique tag
 	       }).
+
+-record(heap, {ttab,tfree,tnext,
+	       ftab,ffree,fnext}).
 
 %% -record(etab, {tabs=[],free=[],next=0}).	%Tables structure
 %% -record(eenv, {env=[]}).			%Environment
