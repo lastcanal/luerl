@@ -655,6 +655,11 @@ functioncall({function,Func}, Args, Stk, #luerl{stk=Stk0}=St0) ->
     %% Here we must save the stack in state as function may need it.
     {Ret,St1} = Func(Args, St0#luerl{stk=Stk}),
     {Ret,St1#luerl{stk=Stk0}};			%Replace it
+functioncall({mfa,M,F,A}, Args, Stk, St) ->
+    case apply(M,F,A) of
+  Fun when is_function(Fun) -> functioncall({function, Fun}, Args, Stk, St);
+  Other -> badarg_error(Other, {mfa,M,F,A}, St)
+    end;
 functioncall(Func, Args, Stk, St) ->
     case getmetamethod(Func, <<"__call">>, St) of
 	nil -> badarg_error(Func, Args, St);
