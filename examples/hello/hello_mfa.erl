@@ -1,12 +1,13 @@
 -module(hello_mfa).
 -export([run/0, fun_factory/1]).
 
-fun_factory(Name) ->
-  fun([_Url], LuaState) ->
+%% returns a function that is callable by Luerl
+fun_factory(Outer) ->
+  fun([Inner], LuaState) ->
     % check out process from Pool
     % call ihttpc request
     % recieve response
-    {[Name, <<"inner">>], LuaState}
+    {[Outer, Inner], LuaState}
   end.
 
 run() ->
@@ -33,11 +34,11 @@ run() ->
   {HttpTable, Lua3} = luerl:set_table1(FunctionPath, Value, Lua2),
 
   %% Call the function from Erlang
-  {Resp, _Lua5} = luerl:call_function1(FunctionPath, ["http://google.com"], Lua3),
+  {Resp, _Lua5} = luerl:call_function1(FunctionPath, [<<"inner">>], Lua3),
   io:format("(1) ~p~n", [Resp]),
 
   %% Or call the function from Lua
-  {Resp, _Lua7} = luerl:do("return http.request('http://google.com')", Lua3),
+  {Resp, _Lua7} = luerl:do("return http.request('inner')", Lua3),
   io:format("(2) ~p~n", [Resp]),
 
   [<<"outer">>, <<"inner">>] = Resp.
